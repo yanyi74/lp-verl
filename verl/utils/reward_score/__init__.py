@@ -90,6 +90,14 @@ def default_compute_score(
         from . import geo3k
 
         res = geo3k.compute_score(solution_str, ground_truth)
+    elif data_source == "vppo":
+        from . import vppo
+
+        res = vppo.compute_score(solution_str, ground_truth, extra_info)
+    elif data_source == "mmrl":
+        from . import mmrl
+
+        res = mmrl.compute_score(solution_str, ground_truth, extra_info)
     elif data_source in [
         "searchR1_nq",
         "searchR1_triviaqa",

@@ -142,6 +142,7 @@ def compute_advantage(
     num_repeat: int = 1,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    lp_state: Optional[dict] = None,
 ) -> DataProto:
     """Compute advantage estimates for policy optimization.
 
@@ -192,6 +193,9 @@ def compute_advantage(
             response_mask=grpo_calculation_mask,
             index=data.non_tensor_batch["uid"],
             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+            non_tensor_batch=data.non_tensor_batch,
+            lp_state=lp_state,
+            config=config,
         )
         data.batch["advantages"] = advantages
         data.batch["returns"] = returns
@@ -211,6 +215,19 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.GDPO, "gdpo"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["batch"] = data.batch
+        # LP-GRPO: needs per-prompt persistent index (from non_tensor_batch["index"])
+        # and trainer-owned lp_state for EMA / p_0 across steps.
+        if adv_estimator in (AdvantageEstimator.LP_GRPO, "lp_grpo"):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["lp_state"] = lp_state
+        # LP-GRPO Async: same plumbing as lp_grpo (persistent index + lp_state)
+        if adv_estimator in (AdvantageEstimator.LP_GRPO_ASYNC, "lp_grpo_async"):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["lp_state"] = lp_state
+        # LP-GRPO v1.1: fused ZPD+difficulty + tanh-bounded progress (sym or asym)
+        if adv_estimator in (AdvantageEstimator.LP_GRPO_V11, "lp_grpo_v11"):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["lp_state"] = lp_state
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -488,7 +505,7 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        reward_keys = set({"data_source", "reward_model", "extra_info", "uid", "index"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = []
@@ -954,6 +971,60 @@ class RayPPOTrainer:
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.global_steps))
 
+    def _load_lp_grpo_p0_from_dataset(self):
+        """Populate self.lp_state['p_0_map'] from the train dataset's `p_zero` column.
+
+        Expects the user to precompute per-prompt initial pass rate offline and
+        store it as a top-level `p_zero` column in the parquet. The persistent
+        prompt id matches what rl_dataset.py uses at runtime: extra_info['index']
+        (defaulting to 0 if missing).
+
+        Silent no-op if the dataset has no `p_zero` column; LP-GRPO will still
+        run, with the per-step fallback (p_0 := current p_t) until B1's epoch-end
+        refresh fills p_0_map from observed pass rates.
+        """
+        ds_obj = self.train_dataset
+        if not hasattr(ds_obj, "dataframe"):
+            print("[LP-GRPO] train_dataset has no `dataframe` attribute; skipping p_0 load.")
+            return
+        df = ds_obj.dataframe
+        if "p_zero" not in df.column_names:
+            print(
+                "[LP-GRPO] WARN: dataset has no 'p_zero' column. p_0_map starts empty; "
+                "LP weighting will be a no-op until epoch-end refresh (B1) fills it."
+            )
+            return
+
+        eps_p = self.config.algorithm.get("lp_eps_p", 0.05)
+        p_zero_list = list(df["p_zero"])
+        extra_list = list(df["extra_info"]) if "extra_info" in df.column_names else [None] * len(df)
+
+        n_total = len(p_zero_list)
+        n_loaded = 0
+        seen_indices: set = set()
+        n_collisions = 0
+        for p0, extra in zip(p_zero_list, extra_list):
+            if p0 is None:
+                continue
+            idx = (extra or {}).get("index", 0) if isinstance(extra, dict) else 0
+            if idx in seen_indices:
+                n_collisions += 1
+            else:
+                seen_indices.add(idx)
+            self.lp_state["p_0_map"][idx] = min(max(float(p0), eps_p), 1.0 - eps_p)
+            n_loaded += 1
+
+        print(
+            f"[LP-GRPO] Loaded p_zero from dataset: {n_loaded}/{n_total} prompts; "
+            f"unique indices={len(seen_indices)}, collisions={n_collisions}."
+        )
+        if n_collisions > 0:
+            print(
+                "[LP-GRPO] WARN: prompt index collisions detected. Each prompt should "
+                "have a unique extra_info['index']; otherwise multiple prompts will share "
+                "the same p_0 entry and EMA state will be stomped across them."
+            )
+
     def _load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
             return 0
@@ -1293,6 +1364,17 @@ class RayPPOTrainer:
 
         self.global_steps = 0
 
+        # LP-GRPO state: per-prompt initial pass rate (p_0) and last raw p_t.
+        # Keys are persistent prompt ids from non_tensor_batch["index"].
+        # p_0_map is loaded from the dataset's `p_zero` column (user-prepared
+        # offline) and refreshed each epoch from last_p_t_map.
+        self.lp_state = {"p_0_map": {}, "last_p_t_map": {}}
+        # Always attempt to load p_0_map from the dataset's p_zero column.
+        # _load_lp_grpo_p0_from_dataset is a no-op when the column is absent, so
+        # this is safe for datasets without p_zero. For GRPO runs this enables LP
+        # bucket monitoring without affecting the gradient computation.
+        self._load_lp_grpo_p0_from_dataset()
+
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
         self.checkpoint_manager.update_weights(self.global_steps)
@@ -1354,9 +1436,81 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
-                gen_batch_output = gen_batch.repeat(
-                    repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+
+                # LP-GRPO: optionally compute adaptive per-prompt rollout count N_g
+                # (uses lagged p_t from last_p_t_map; falls back to p_0 for first-seen prompts).
+                # When enabled, both gen_batch and batch get repeated by N_g (variable per row)
+                # instead of by a uniform rollout.n.
+                lp_use_adaptive_n = (
+                    self.config.algorithm.adv_estimator in (
+                        AdvantageEstimator.LP_GRPO, "lp_grpo",
+                        AdvantageEstimator.LP_GRPO_ASYNC, "lp_grpo_async",
+                        AdvantageEstimator.LP_GRPO_V11, "lp_grpo_v11",
+                    )
+                    and self.config.algorithm.get("lp_adaptive_n", False)
+                    and "index" in gen_batch.non_tensor_batch
                 )
+                if lp_use_adaptive_n:
+                    persistent_indices = gen_batch.non_tensor_batch["index"]
+                    n_default = self.config.actor_rollout_ref.rollout.n
+                    n_total_budget = len(persistent_indices) * n_default
+                    alloc_mode = self.config.algorithm.get("lp_n_alloc_mode", "weighted")
+                    n_g_bucket_idx = None
+                    if alloc_mode == "bucket":
+                        bucket_mult = {
+                            "breakthrough": self.config.algorithm.get("lp_n_mult_breakthrough", 1.3),
+                            "progress":     self.config.algorithm.get("lp_n_mult_progress", 1.0),
+                            "plateau":      self.config.algorithm.get("lp_n_mult_plateau", 2.0),
+                            "regressing":   self.config.algorithm.get("lp_n_mult_regressing", 1.5),
+                            "mastered":     self.config.algorithm.get("lp_n_mult_mastered", 0.5),
+                        }
+                        n_g_array, n_g_bucket_idx = core_algos.compute_lp_n_allocation_bucket(
+                            persistent_indices=persistent_indices,
+                            p_0_map=self.lp_state["p_0_map"],
+                            last_p_t_map=self.lp_state["last_p_t_map"],
+                            n_total=n_total_budget,
+                            bucket_mult=bucket_mult,
+                            n_min=self.config.algorithm.get("lp_n_min", 2),
+                            n_max=self.config.algorithm.get("lp_n_max", None),
+                        )
+                    else:
+                        n_g_array = core_algos.compute_lp_n_allocation(
+                            persistent_indices=persistent_indices,
+                            p_0_map=self.lp_state["p_0_map"],
+                            last_p_t_map=self.lp_state["last_p_t_map"],
+                            n_total=n_total_budget,
+                            lp_gamma=self.config.algorithm.get("lp_gamma", 0.5),
+                            lp_lambda=self.config.algorithm.get("lp_lambda", 3.0),
+                            lp_w_max=self.config.algorithm.get("lp_w_max", 5.0),
+                            lp_eps_p=self.config.algorithm.get("lp_eps_p", 0.05),
+                            n_min=self.config.algorithm.get("lp_n_min", 2),
+                            n_max=self.config.algorithm.get("lp_n_max", None),
+                        )
+                    # Log distribution of N_g
+                    metrics["lp/n_g/mean"] = float(n_g_array.mean())
+                    metrics["lp/n_g/std"] = float(n_g_array.std())
+                    metrics["lp/n_g/min"] = int(n_g_array.min())
+                    metrics["lp/n_g/max"] = int(n_g_array.max())
+                    metrics["lp/n_g/sum"] = int(n_g_array.sum())
+                    # Per-bucket N stats (only meaningful in "bucket" mode)
+                    if n_g_bucket_idx is not None:
+                        for bi, bname in enumerate(core_algos.LP_BUCKET_NAMES):
+                            mask = (n_g_bucket_idx == bi)
+                            cnt = int(mask.sum())
+                            metrics[f"lp/n_g/by_bucket/{bname}/count"] = cnt
+                            if cnt > 0:
+                                metrics[f"lp/n_g/by_bucket/{bname}/mean"] = float(n_g_array[mask].mean())
+                        first_seen_mask = (n_g_bucket_idx == -1)
+                        fs_cnt = int(first_seen_mask.sum())
+                        metrics["lp/n_g/by_bucket/first_seen/count"] = fs_cnt
+                        if fs_cnt > 0:
+                            metrics["lp/n_g/by_bucket/first_seen/mean"] = float(n_g_array[first_seen_mask].mean())
+                    gen_batch_output = gen_batch.repeat_per_row(n_g_array)
+                else:
+                    n_g_array = None
+                    gen_batch_output = gen_batch.repeat(
+                        repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True
+                    )
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1401,7 +1555,10 @@ class RayPPOTrainer:
 
                             del rm_scores, gen_baseline_batch, gen_baseline_output
                     # repeat to align with repeated responses in rollout
-                    batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    if lp_use_adaptive_n and n_g_array is not None:
+                        batch = batch.repeat_per_row(n_g_array)
+                    else:
+                        batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
 
                     if "response_mask" not in batch.batch.keys():
@@ -1537,6 +1694,7 @@ class RayPPOTrainer:
                             num_repeat=self.config.actor_rollout_ref.rollout.n,
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
+                            lp_state=self.lp_state,
                         )
 
                     # update critic
@@ -1635,6 +1793,9 @@ class RayPPOTrainer:
                             metrics[f"gdpo/{key}/std"] = float(np.std(vals))
                             metrics[f"gdpo/{key}/max"] = float(np.max(vals))
                             metrics[f"gdpo/{key}/min"] = float(np.min(vals))
+                # LP-GRPO per-step LP-internal metrics (w / KL / state buckets)
+                if self.lp_state.get("last_metrics"):
+                    metrics.update(self.lp_state["last_metrics"])
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()
@@ -1666,3 +1827,25 @@ class RayPPOTrainer:
                 if hasattr(self.train_dataset, "on_batch_end"):
                     # The dataset may be changed after each training batch
                     self.train_dataset.on_batch_end(batch=batch)
+
+            # === LP-GRPO: epoch-end p_0 snapshot (for logging only) ===
+            # p_0_map is now updated per-step via EMA inside compute_lp_grpo_outcome_advantage
+            # (see lp_p0_ema_alpha). We just log the distribution at epoch boundaries so we
+            # can track how p_0 evolves across epochs.
+            if self.config.algorithm.adv_estimator in (
+                AdvantageEstimator.LP_GRPO, "lp_grpo",
+                AdvantageEstimator.LP_GRPO_ASYNC, "lp_grpo_async",
+                AdvantageEstimator.LP_GRPO_V11, "lp_grpo_v11",
+            ) and self.lp_state["p_0_map"]:
+                p0_vals = np.array(list(self.lp_state["p_0_map"].values()), dtype=np.float64)
+                if len(p0_vals) > 0:
+                    epoch_metrics = {
+                        "lp/epoch/p0/mean": float(p0_vals.mean()),
+                        "lp/epoch/p0/p10":  float(np.percentile(p0_vals, 10)),
+                        "lp/epoch/p0/p25":  float(np.percentile(p0_vals, 25)),
+                        "lp/epoch/p0/p50":  float(np.percentile(p0_vals, 50)),
+                        "lp/epoch/p0/p75":  float(np.percentile(p0_vals, 75)),
+                        "lp/epoch/p0/p90":  float(np.percentile(p0_vals, 90)),
+                        "lp/epoch/n_prompts": len(p0_vals),
+                    }
+                    logger.log(data=epoch_metrics, step=self.global_steps)

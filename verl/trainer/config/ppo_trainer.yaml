@@ -109,6 +109,57 @@ algorithm:
     # Power used for weight scaling in "pow" method
     weight_pow: 2.0
 
+  # LP-GRPO (Learning-Progress GRPO): per-prompt advantage weighting by Bernoulli KL.
+  # improving:          w = (1-p_0)^lp_gamma * clip(1 + lp_lambda*KL[Bern(p_t)||Bern(p_0)], 1, lp_w_max)
+  # regressing/plateau: w = (1-p_t)^lp_gamma
+  # Only used when adv_estimator == "lp_grpo".
+  lp_gamma: 0.5
+  lp_lambda: 3.0
+  lp_w_max: 3.0
+  lp_eps_p: 0.05
+  # Normalize w to mean 1 within each batch (fixes implicit LR decay).
+  lp_normalize_w: false
+  # Hard-clip mode (AWR/AWAC-style). When lp_w_clip_hi > lp_w_clip_lo > 0,
+  # w is clipped to [lp_w_clip_lo, lp_w_clip_hi] and mean normalization is skipped.
+  # Set both to 0.0 to disable (default).
+  lp_w_clip_lo: 0.0
+  lp_w_clip_hi: 0.0
+  # ZPD modulation (one-sided): only compresses p_t > 0.5 (mastered end).
+  # 0 disables; 1 standard. Preserves breakthrough's rare-success signal.
+  lp_zpd_strength: 0.0
+  # Per-step EMA on p_0_map. 0 freezes p_0=p_zero; 1 = old epoch-end-overwrite.
+  lp_p0_ema_alpha: 0.0
+  # Bucket-aware multipliers (1.0 = no effect):
+  lp_breakthrough_boost: 1.0
+  lp_progress_boost: 1.0
+  lp_regressing_penalty: 1.0
+  # Adaptive per-prompt rollout count (N_g) using LP weights. When true,
+  # high-LP prompts get more rollouts than fixed rollout.n; low-LP get fewer.
+  # Total rollout budget = batch_size * rollout.n stays constant.
+  lp_adaptive_n: false
+  lp_n_min: 2
+  lp_n_max: null
+  # Allocation mode when lp_adaptive_n=true:
+  #   "weighted": N_g proportional to LP weight w (current behavior)
+  #   "bucket":   N_g by 5-bucket learning state (first-seen uses variance fallback)
+  lp_n_alloc_mode: weighted
+  # Bucket multipliers for "bucket" mode (normalized internally; total budget preserved).
+  lp_n_mult_breakthrough: 1.3
+  lp_n_mult_progress: 1.0
+  lp_n_mult_plateau: 2.0
+  lp_n_mult_regressing: 1.5
+  lp_n_mult_mastered: 0.5
+
+  # LP-GRPO v1.1 hyperparameters (for adv_estimator='lp_grpo_v11')
+  # Formula: w = 4*p_t*(1-p_t)^(gamma+1) * f_prog(delta)
+  #   improving (delta>=0): f_prog = 1 + alpha*tanh(lambda*delta)
+  #   regressing (delta<0): f_prog = 1 + beta*tanh(lambda*|delta|)
+  # Set beta=alpha for SYMMETRIC, beta<alpha for ASYMMETRIC (improving stronger).
+  lp_v11_gamma: 0.5
+  lp_v11_alpha: 1.5
+  lp_v11_beta: 0.5
+  lp_v11_lambda: 5.0
+
 # config for the trainer
 trainer:
 

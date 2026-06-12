@@ -667,3 +667,70 @@ class AlgoConfig(BaseConfig):
     # gdpo_reward_weights: per-dimension weights for aggregation (default: equal weights).
     gdpo_reward_keys: Optional[list[str]] = None
     gdpo_reward_weights: Optional[list[float]] = None
+
+    # LP-GRPO (Learning-Progress GRPO): per-prompt advantage weighting by KL[Bern(p_t)||Bern(p_0)].
+    # Only takes effect when adv_estimator == "lp_grpo".
+    # improving: w = (1-p_0)^lp_gamma * clip(1 + lp_lambda*KL, 1, lp_w_max)
+    # regressing/plateau: w = (1-p_t)^lp_gamma
+    lp_gamma: float = 0.5
+    lp_lambda: float = 3.0
+    lp_w_max: float = 3.0
+    lp_eps_p: float = 0.05
+    # If True, normalize w so that mean(w) == 1 within each batch. This fixes the
+    # implicit LR decay caused by mean(w) drifting downward as training progresses.
+    lp_normalize_w: bool = False
+    # Hard-clip mode (AWR/AWAC-style). When lp_w_clip_hi > lp_w_clip_lo > 0, w is
+    # clipped to [lp_w_clip_lo, lp_w_clip_hi] and mean normalization is skipped.
+    # Avoids the amplification drift of mean-norm (denominator drifts as raw_w_mean
+    # changes during training). Recommended starting values: [0.2, 2.0].
+    # Priority: hard-clip > mean-norm > raw (no-op).
+    lp_w_clip_lo: float = 0.0
+    lp_w_clip_hi: float = 0.0
+    # ZPD (zone of proximal development) modulation: w *= (4*p_t*(1-p_t))^lp_zpd_strength.
+    # Acts as a GRPO gradient-signal detector — p_t in {0,1} gives 0 (no learning signal,
+    # auto-release the budget), p_t = 0.5 gives 1 (full retain). 0 disables, 1 = standard
+    # ZPD, higher values = sharper end-tail decay.
+    lp_zpd_strength: float = 0.0
+    # Per-step EMA update on p_0_map: p_0_new = (1 - alpha) * p_0_old + alpha * p_t.
+    # 0 = freeze p_0 at offline p_zero forever; 1 = overwrite every occurrence (= old
+    # epoch-end-overwrite behavior). Small values (0.1-0.2) keep KL signal alive across
+    # epochs while letting p_0 slowly track the model.
+    lp_p0_ema_alpha: float = 0.0
+    # Bucket-aware multipliers applied to w on top of (1-p_0)^γ × f_prog × ZPD.
+    # Directly steer per-bucket gradient strength to match the desired bucket dynamics
+    # (more breakthrough/progress, fewer regressing, plateau stays). Defaults are 1.0
+    # = no effect; set >1 to boost, <1 to penalize.
+    lp_breakthrough_boost: float = 1.0    # boost rare-success on hard prompts
+    lp_progress_boost: float = 1.0        # boost prompts that are actively improving
+    lp_regressing_penalty: float = 1.0    # downweight prompts that are getting worse
+    # If True, use LP weights to adaptively allocate per-prompt rollout counts (N_g)
+    # instead of (or in addition to) the fixed rollout.n. Total rollout budget stays
+    # constant; high-LP prompts get more rollouts, low-LP get fewer. Uses lagged p_t
+    # (from previous step) since current-step p_t requires rollouts to be done first.
+    lp_adaptive_n: bool = False
+    lp_n_min: int = 2     # minimum rollouts per prompt (>=2 keeps GRPO std defined)
+    lp_n_max: Optional[int] = None  # optional cap; LP w is bounded by lp_w_max already
+    # Allocation mode when lp_adaptive_n=True:
+    #   "weighted" (default): N_g proportional to LP weight w (high-LP -> more rollouts)
+    #   "bucket":             N_g by 5-bucket learning state; first-seen prompts use
+    #                         variance-driven fallback (p_0*(1-p_0)) so the first
+    #                         epoch still works. Aimed at giving plateau prompts more
+    #                         rollouts to escape their noisy reward signal.
+    lp_n_alloc_mode: str = "weighted"
+    # Bucket multipliers for "bucket" mode. Higher = more rollouts. Multipliers are
+    # normalized internally so total budget is preserved.
+    lp_n_mult_breakthrough: float = 1.3
+    lp_n_mult_progress: float = 1.0
+    lp_n_mult_plateau: float = 2.0   # the lever for "escape plateau"
+    lp_n_mult_regressing: float = 1.5
+    lp_n_mult_mastered: float = 0.5
+
+    # LP-GRPO v1.1 hyperparameters (for adv_estimator='lp_grpo_v11')
+    # Formula: w = 4·p_t·(1-p_t)^(gamma+1) · f_prog(delta)
+    #   improving (delta>=0): f_prog = 1 + alpha·tanh(lambda·delta)
+    #   regressing (delta<0): f_prog = 1 + beta·tanh(lambda·|delta|)
+    # Set beta = alpha for SYMMETRIC, beta < alpha for ASYMMETRIC (improving stronger).
+    lp_v11_gamma: float = 0.5    # ZPD-difficulty shape, peak at p_t = 1/(gamma+2)
+    lp_v11_alpha: float = 1.5    # improving amplification strength
+    lp_v11_beta: float = 0.5     # regressing amplification (beta=alpha: sym, beta<alpha: asym)
+    lp_v11_lambda: float = 5.0   # tanh saturation speed

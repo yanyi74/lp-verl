@@ -114,6 +114,7 @@ class RLHFDataset(Dataset):
         self.truncation = config.get("truncation", "error")
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
+        self.system_prompt = config.get("system_prompt", None)
 
         self.tool_config_path = config.get("tool_config_path", None)
         self.tool_schemas = None
@@ -312,7 +313,9 @@ class RLHFDataset(Dataset):
         Returns:
             messages: List of messages with replaced placeholder.
         """
-        messages: list = example[key]
+        messages: list = list(example[key])
+        if self.system_prompt and (not messages or messages[0].get("role") != "system"):
+            messages = [{"role": "system", "content": self.system_prompt}] + messages
         # When concatenating image and video datasets, get will return None for image or video sample
         images = example.get(self.image_key, None) or []
         videos = example.get(self.video_key, None) or []
@@ -338,6 +341,7 @@ class RLHFDataset(Dataset):
                         image = image.convert("RGB")
                         content_list.append({"type": "image", "image": image})
                     elif isinstance(image, dict):
+                        image = dict(image)
                         if "bytes" in image:
                             image["image"] = Image.open(BytesIO(image["bytes"]))
                         content_list.append({"type": "image", **image})

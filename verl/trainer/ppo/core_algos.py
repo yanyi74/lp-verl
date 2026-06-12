@@ -108,6 +108,9 @@ class AdvantageEstimator(str, Enum):
     OPTIMAL_TOKEN_BASELINE = "optimal_token_baseline"
     TIR_OPTIMAL_TOKEN_BASELINE = "tir_optimal_token_baseline"
     GDPO = "gdpo"
+    LP_GRPO = "lp_grpo"
+    LP_GRPO_ASYNC = "lp_grpo_async"
+    LP_GRPO_V11 = "lp_grpo_v11"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -272,6 +275,8 @@ def compute_grpo_outcome_advantage(
     epsilon: float = 1e-6,
     norm_adv_by_std_in_grpo: bool = True,
     config: Optional[AlgoConfig] = None,
+    non_tensor_batch: Optional[dict] = None,
+    lp_state: Optional[dict] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Compute advantage for GRPO, operating only on Outcome reward
@@ -290,6 +295,12 @@ def compute_grpo_outcome_advantage(
             whether to scale the GRPO advantage
         config: `(Optional[AlgoConfig])`
             algorithm configuration object
+        non_tensor_batch: `(Optional[dict])`
+            non-tensor batch data; if it contains "index" (persistent prompt id)
+            and lp_state has p_0_map, LP bucket metrics are logged (gradients unaffected).
+        lp_state: `(Optional[dict])`
+            mutable LP state dict; if provided alongside non_tensor_batch["index"]
+            and p_0_map, LP monitoring metrics are written to lp_state["last_metrics"].
 
     Note:
         If norm_adv_by_std_in_grpo is True, the advantage is scaled by the std, as in the original GRPO.
@@ -328,7 +339,141 @@ def compute_grpo_outcome_advantage(
                 scores[i] = scores[i] - id2mean[index[i]]
         scores = scores.unsqueeze(-1) * response_mask
 
+    # LP monitoring: compute bucket stats for analysis without touching gradients.
+    # Only runs when the dataset provides p_zero (persistent p_0 per prompt).
+    _grpo_lp_monitoring(
+        index=index,
+        id2mean=id2mean,
+        id2std=id2std,
+        non_tensor_batch=non_tensor_batch,
+        lp_state=lp_state,
+        config=config,
+        epsilon=epsilon,
+    )
+
     return scores, scores
+
+
+def _grpo_lp_monitoring(
+    index: np.ndarray,
+    id2mean: dict,
+    id2std: Optional[dict],
+    non_tensor_batch: Optional[dict],
+    lp_state: Optional[dict],
+    config: Optional[Any],
+    epsilon: float = 1e-6,
+) -> None:
+    """Compute LP bucket metrics for monitoring without modifying advantages.
+
+    Writes results to lp_state["last_metrics"] so the trainer can log them
+    alongside LP-GRPO metrics for direct comparison. Mirrors the same
+    post-processing pipeline (clip / useful-mean-norm) that LP-GRPO uses, so
+    baseline runs produce directly comparable lp/w/* metrics.
+    """
+    if (
+        lp_state is None
+        or not lp_state.get("p_0_map")
+        or non_tensor_batch is None
+        or "index" not in non_tensor_batch
+    ):
+        return
+
+    lp_eps_p = config.get("lp_eps_p", 0.05) if config is not None else 0.05
+    lp_gamma = config.get("lp_gamma", 0.5) if config is not None else 0.5
+    lp_lambda = config.get("lp_lambda", 3.0) if config is not None else 3.0
+    lp_zpd_strength = config.get("lp_zpd_strength", 1.0) if config is not None else 1.0
+    lp_w_clip_lo = config.get("lp_w_clip_lo", 0.0) if config is not None else 0.0
+    lp_w_clip_hi = config.get("lp_w_clip_hi", 0.0) if config is not None else 0.0
+    lp_normalize_w = config.get("lp_normalize_w", False) if config is not None else False
+
+    p_0_map = lp_state["p_0_map"]
+    last_p_t_map = lp_state.setdefault("last_p_t_map", {})
+    persistent_idx_arr = non_tensor_batch["index"]
+
+    uid_to_persistent = {}
+    for i, uid in enumerate(index):
+        if uid not in uid_to_persistent:
+            uid_to_persistent[uid] = persistent_idx_arr[i]
+
+    bucket_counts = {k: 0 for k in ("breakthrough", "progress", "plateau", "mastered", "regressing")}
+    log_w, log_kl, log_fdiff, log_fprog, log_p0, log_pt = [], [], [], [], [], []
+    plateau_pt = []
+    # Track per-uid raw w + whether the group is "useful" (σ_g > eps) so we can
+    # apply the same post-processing the LP-GRPO branch does.
+    uid_to_w: dict = {}
+    uid_useful: dict = {}
+
+    for uid, group_mean in id2mean.items():
+        persistent_idx = uid_to_persistent.get(uid)
+        if persistent_idx is None or persistent_idx not in p_0_map:
+            continue
+        p_t = float(group_mean.item())
+        p_0 = float(p_0_map[persistent_idx])
+        last_p_t_map[persistent_idx] = p_t
+
+        p_0_c = min(max(p_0, lp_eps_p), 1.0 - lp_eps_p)
+        p_t_c = min(max(p_t, lp_eps_p), 1.0 - lp_eps_p)
+        delta_abs = abs(p_t - p_0)
+        kl = float(p_t_c * np.log(p_t_c / p_0_c) + (1.0 - p_t_c) * np.log((1.0 - p_t_c) / (1.0 - p_0_c)))
+
+        if p_t > p_0:
+            f_diff = (1.0 - p_0_c) ** lp_gamma
+            f_prog = 1.0 + lp_lambda * delta_abs
+        else:
+            f_diff = (1.0 - p_t_c) ** lp_gamma
+            f_prog = 1.0
+        zpd = (4.0 * p_t_c * (1.0 - p_t_c)) ** lp_zpd_strength if lp_zpd_strength > 0 else 1.0
+        w = f_diff * f_prog * zpd
+        uid_to_w[uid] = w
+        if id2std is not None and uid in id2std:
+            uid_useful[uid] = float(id2std[uid].item()) > epsilon
+        else:
+            uid_useful[uid] = True  # if std unknown, assume useful
+
+        bucket = _classify_lp_bucket(p_0, p_t)
+        bucket_counts[bucket] += 1
+        if bucket == "plateau":
+            plateau_pt.append(p_t)
+        log_w.append(w); log_kl.append(kl); log_fdiff.append(f_diff)
+        log_fprog.append(f_prog); log_p0.append(p_0); log_pt.append(p_t)
+
+    if not log_w:
+        return
+
+    w_arr_raw = np.asarray(log_w, dtype=np.float64)
+    kl_arr = np.asarray(log_kl, dtype=np.float64)
+    raw_w_mean = float(w_arr_raw.mean()) if len(w_arr_raw) > 0 else 1.0
+    useful_w_raw = np.asarray([w for uid, w in uid_to_w.items() if uid_useful.get(uid, True)],
+                              dtype=np.float64)
+    useful_w_mean = float(useful_w_raw.mean()) if len(useful_w_raw) > 0 else raw_w_mean
+    n_useful = len(useful_w_raw)
+
+    # Mirror LP-GRPO post-processing so baseline monitoring stats are comparable.
+    if lp_w_clip_hi > lp_w_clip_lo > 0:
+        w_arr = np.clip(w_arr_raw, lp_w_clip_lo, lp_w_clip_hi)
+    elif lp_normalize_w and useful_w_mean > 0:
+        w_arr = w_arr_raw / useful_w_mean
+    else:
+        w_arr = w_arr_raw
+
+    lp_state["last_metrics"] = {
+        "lp/w/mean": float(w_arr.mean()), "lp/w/std": float(w_arr.std()),
+        "lp/w/min": float(w_arr.min()), "lp/w/max": float(w_arr.max()),
+        "lp/w/raw_mean": raw_w_mean,
+        "lp/w/useful_mean": useful_w_mean,
+        "lp/w/n_useful": n_useful,
+        "lp/w/cap_rate": 0.0,
+        "lp/kl/mean": float(kl_arr.mean()), "lp/kl/p50": float(np.median(kl_arr)),
+        "lp/kl/p95": float(np.quantile(kl_arr, 0.95)),
+        "lp/f_diff/mean": float(np.mean(log_fdiff)),
+        "lp/f_prog/mean": float(np.mean(log_fprog)),
+        "lp/p_0/mean": float(np.mean(log_p0)),
+        "lp/p_t/mean": float(np.mean(log_pt)),
+        **{f"lp/bucket/{k}": v for k, v in bucket_counts.items()},
+        "lp/n_groups": len(log_w),
+        **({"lp/plateau/p_t_mean": float(np.mean(plateau_pt)),
+            "lp/plateau/p_t_low_rate": float(np.mean(np.array(plateau_pt) < 0.3))} if plateau_pt else {}),
+    }
 
 
 @register_adv_est(AdvantageEstimator.GRPO_VECTORIZED)
@@ -356,6 +501,830 @@ def compute_grpo_vectorized_outcome_advantage(
             scalars = scores - mean_g[g]
         advantages = scalars.unsqueeze(-1) * response_mask
         return advantages, advantages
+
+
+@register_adv_est(AdvantageEstimator.LP_GRPO)  # or simply: @register_adv_est("lp_grpo")
+def compute_lp_grpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    non_tensor_batch: Optional[dict] = None,
+    lp_state: Optional[dict] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LP-GRPO: GRPO advantage multiplied by per-prompt weight w(p_0, p_t).
+
+    Improving  (p_t > p_0): w = (1-p_0)^gamma * clip(1 + lambda*KL[Bern(p_t)||Bern(p_0)], 1, w_max)
+    Regressing (p_t <= p_0): w = (1-p_t)^gamma
+
+    p_0 is the per-prompt pass rate at epoch start; p_t is this step's pass rate
+    from N rollouts. Using p_t for f_diff when regressing ensures forgotten prompts
+    recover appropriate gradient weight despite a high historical p_0.
+
+    Args:
+        token_level_rewards: (bs, response_length)
+        response_mask: (bs, response_length)
+        index: per-step group id (uuid), used to group rollouts of the same prompt.
+        epsilon: numerical stability for std normalization.
+        norm_adv_by_std_in_grpo: if True, GRPO base; if False, Dr.GRPO base.
+        config: AlgoConfig with lp_gamma, lp_lambda, lp_w_max, lp_eps_p.
+        non_tensor_batch: must contain "index" (persistent prompt id from dataset).
+        lp_state: mutable dict with "p_0_map" (required) and "last_p_t_map"
+            (created on demand). Mutated in place.
+
+    Returns:
+        (advantages, returns), both shape (bs, response_length).
+    """
+    if non_tensor_batch is None or "index" not in non_tensor_batch:
+        raise ValueError(
+            "lp_grpo requires non_tensor_batch['index'] (persistent prompt id). "
+            "Make sure compute_advantage forwards non_tensor_batch."
+        )
+    if lp_state is None or "p_0_map" not in lp_state:
+        raise ValueError(
+            "lp_grpo requires lp_state with 'p_0_map'. The trainer must initialize "
+            "lp_state via a baseline rollout before training starts."
+        )
+
+    if config is not None:
+        lp_gamma = config.get("lp_gamma", 0.5)
+        lp_lambda = config.get("lp_lambda", 3.0)
+        lp_w_max = config.get("lp_w_max", 3.0)
+        lp_eps_p = config.get("lp_eps_p", 0.05)
+        lp_normalize_w = config.get("lp_normalize_w", False)
+        lp_w_clip_lo = config.get("lp_w_clip_lo", 0.0)
+        lp_w_clip_hi = config.get("lp_w_clip_hi", 0.0)
+        lp_zpd_strength = config.get("lp_zpd_strength", 0.0)
+        lp_p0_ema_alpha = config.get("lp_p0_ema_alpha", 0.0)
+        lp_breakthrough_boost = config.get("lp_breakthrough_boost", 1.0)
+        lp_progress_boost = config.get("lp_progress_boost", 1.0)
+        lp_regressing_penalty = config.get("lp_regressing_penalty", 1.0)
+    else:
+        lp_gamma, lp_lambda, lp_w_max, lp_eps_p = 0.5, 3.0, 3.0, 0.05
+        lp_normalize_w = False
+        lp_w_clip_lo = 0.0
+        lp_w_clip_hi = 0.0
+        lp_zpd_strength = 0.0
+        lp_p0_ema_alpha = 0.0
+        lp_breakthrough_boost = 1.0
+        lp_progress_boost = 1.0
+        lp_regressing_penalty = 1.0
+
+    p_0_map = lp_state["p_0_map"]
+    last_p_t_map = lp_state.setdefault("last_p_t_map", {})
+    persistent_idx_arr = non_tensor_batch["index"]
+
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean: dict = {}
+    id2std: dict = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            id2score[index[i]].append(scores[i])
+        for idx in id2score:
+            if len(id2score[idx]) == 1:
+                id2mean[idx] = torch.tensor(0.0)
+                id2std[idx] = torch.tensor(1.0)
+            elif len(id2score[idx]) > 1:
+                scores_tensor = torch.stack(id2score[idx])
+                id2mean[idx] = torch.mean(scores_tensor)
+                id2std[idx] = torch.std(scores_tensor)
+            else:
+                raise ValueError(f"no score in prompt index: {idx}")
+
+        # uid -> persistent prompt index (same across all N rollouts of the group)
+        uid_to_persistent = {}
+        for i in range(bsz):
+            uid = index[i]
+            if uid not in uid_to_persistent:
+                uid_to_persistent[uid] = persistent_idx_arr[i]
+
+        # Per-group LP weight + bookkeeping for logging
+        uid_to_w: dict = {}
+        log_w, log_kl, log_fdiff, log_fprog, log_p0, log_pt = [], [], [], [], [], []
+        plateau_pt = []
+        bucket_counts = {
+            "breakthrough": 0,  # p_0<0.2, delta>0.15
+            "progress": 0,      # delta>0.05
+            "plateau": 0,       # |delta|<=0.05, p_0 in [0.2, 0.8]
+            "mastered": 0,      # p_0>0.8 and delta>=0
+            "regressing": 0,    # delta<-0.05
+        }
+        for uid, group_mean in id2mean.items():
+            persistent_idx = uid_to_persistent[uid]
+            p_t = float(group_mean.item())  # binary reward => group mean = success rate
+
+            # Fallback: first epoch without p_zero column uses p_t as p_0 (KL=0, w=f_diff only).
+            p_0 = float(p_0_map.get(persistent_idx, p_t))
+            last_p_t_map[persistent_idx] = p_t
+
+            p_0_c = min(max(p_0, lp_eps_p), 1.0 - lp_eps_p)
+            p_t_c = min(max(p_t, lp_eps_p), 1.0 - lp_eps_p)
+
+            # KL kept for logging/metrics compatibility only — f_prog uses |Δp|.
+            kl = float(
+                p_t_c * np.log(p_t_c / p_0_c)
+                + (1.0 - p_t_c) * np.log((1.0 - p_t_c) / (1.0 - p_0_c))
+            )
+            delta_abs = abs(p_t - p_0)
+
+            # Progress signal: linear in |Δp|, naturally bounded in [1, 1+λ].
+            # Replaces clip(1+λ·KL, 1, w_max) — |Δp| is numerically stable, doesn't
+            # need eps clipping or w_max cap, and is robust to N=8 binomial noise.
+            if p_t > p_0:
+                # Improving: weight by baseline difficulty, amplify by |Δp|.
+                f_diff = (1.0 - p_0_c) ** lp_gamma
+                f_prog = 1.0 + lp_lambda * delta_abs
+            else:
+                # Regressing/plateau: weight by current difficulty only; no amplification.
+                f_diff = (1.0 - p_t_c) ** lp_gamma
+                f_prog = 1.0
+
+            # ZPD (two-sided): w *= (4·p_t·(1-p_t))^β. Acts as GRPO-signal detector
+            # and signal-aware resource allocator — mastered (p_t→1), plateau-easy
+            # and plateau-hard (p_t in {≈0, ≈1}) get compressed; plateau-medium
+            # (p_t≈0.5) retains full weight. lp_zpd_strength=0 disables.
+            if lp_zpd_strength > 0:
+                zpd_factor = (4.0 * p_t_c * (1.0 - p_t_c)) ** lp_zpd_strength
+            else:
+                zpd_factor = 1.0
+
+            # Bucket-aware boost/penalty: directly steer each learning state.
+            # Classify with shared helper so adv-reweight and adaptive-N agree.
+            bucket = _classify_lp_bucket(p_0, p_t)
+            if bucket == "breakthrough":
+                bucket_factor = lp_breakthrough_boost
+            elif bucket == "progress":
+                bucket_factor = lp_progress_boost
+            elif bucket == "regressing":
+                bucket_factor = lp_regressing_penalty
+            else:  # plateau / mastered: no extra factor (mastered already crushed by ZPD)
+                bucket_factor = 1.0
+
+            w = f_diff * f_prog * zpd_factor * bucket_factor
+            uid_to_w[uid] = w
+
+            # Per-step EMA update on p_0 (replaces epoch-end整批覆盖). alpha=0 freezes
+            # p_0 entirely; alpha=1 reduces to the old "overwrite each occurrence" behavior.
+            # We update AFTER computing w so the current step uses the old p_0.
+            if lp_p0_ema_alpha > 0:
+                new_p_0 = (1.0 - lp_p0_ema_alpha) * p_0 + lp_p0_ema_alpha * p_t
+                p_0_map[persistent_idx] = min(max(new_p_0, lp_eps_p), 1.0 - lp_eps_p)
+
+            log_w.append(w); log_kl.append(kl); log_fdiff.append(f_diff)
+            log_fprog.append(f_prog); log_p0.append(p_0); log_pt.append(p_t)
+            bucket_counts[bucket] += 1
+            if bucket == "plateau":
+                plateau_pt.append(p_t)
+
+        # Stash per-step metrics on lp_state for the trainer to consume.
+        w_arr_raw = np.asarray(log_w, dtype=np.float64)
+        kl_arr = np.asarray(log_kl, dtype=np.float64)
+
+        # w regularization (priority: hard-clip > useful-mean-norm > raw):
+        # - hard-clip: bounded w, no drifting denominator.
+        # - useful-mean-norm: forces mean(w)=1 over USEFUL groups (σ_g > eps).
+        #   Stuck groups (σ_g≈0, i.e. all-correct or all-wrong, A=0 regardless of w)
+        #   are excluded from the denominator — they consume zero gradient budget
+        #   so they shouldn't dilute the scaling factor. This makes effective LR on
+        #   useful samples exactly match nominal LR (= baseline GRPO at same nominal).
+        # - raw: use w directly; effective LR scales with raw_w_mean.
+        raw_w_mean = float(w_arr_raw.mean()) if len(w_arr_raw) > 0 else 1.0
+        # Useful mean: average over groups with non-trivial reward variance.
+        useful_uids = [uid for uid, std in id2std.items() if float(std.item()) > epsilon]
+        if useful_uids:
+            useful_w_raw = np.asarray([uid_to_w[uid] for uid in useful_uids], dtype=np.float64)
+            useful_w_mean = float(useful_w_raw.mean()) if len(useful_w_raw) > 0 else raw_w_mean
+        else:
+            useful_w_mean = raw_w_mean
+        if lp_w_clip_hi > lp_w_clip_lo > 0:
+            for uid in uid_to_w:
+                uid_to_w[uid] = float(np.clip(uid_to_w[uid], lp_w_clip_lo, lp_w_clip_hi))
+            w_arr = np.clip(w_arr_raw, lp_w_clip_lo, lp_w_clip_hi)
+        elif lp_normalize_w and useful_w_mean > 0:
+            scale = 1.0 / useful_w_mean
+            for uid in uid_to_w:
+                uid_to_w[uid] *= scale
+            w_arr = w_arr_raw * scale
+        else:
+            w_arr = w_arr_raw
+
+        lp_state["last_metrics"] = {
+            "lp/w/mean": float(w_arr.mean()), "lp/w/std": float(w_arr.std()),
+            "lp/w/min": float(w_arr.min()), "lp/w/max": float(w_arr.max()),
+            "lp/w/raw_mean": raw_w_mean,
+            "lp/w/useful_mean": useful_w_mean,
+            "lp/w/n_useful": len(useful_uids),
+            "lp/w/cap_rate": float((np.asarray(log_fprog) >= lp_w_max - 1e-6).mean()),
+            "lp/kl/mean": float(kl_arr.mean()), "lp/kl/p50": float(np.median(kl_arr)),
+            "lp/kl/p95": float(np.quantile(kl_arr, 0.95)),
+            "lp/f_diff/mean": float(np.mean(log_fdiff)),
+            "lp/f_prog/mean": float(np.mean(log_fprog)),
+            "lp/p_0/mean": float(np.mean(log_p0)),
+            "lp/p_t/mean": float(np.mean(log_pt)),
+            **{f"lp/bucket/{k}": v for k, v in bucket_counts.items()},
+            "lp/n_groups": len(uid_to_w),
+            **({"lp/plateau/p_t_mean": float(np.mean(plateau_pt)),
+                "lp/plateau/p_t_low_rate": float(np.mean(np.array(plateau_pt) < 0.3))} if plateau_pt else {}),
+        }
+
+        for i in range(bsz):
+            w_i = uid_to_w[index[i]]
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon) * w_i
+            else:
+                scores[i] = (scores[i] - id2mean[index[i]]) * w_i
+        scores = scores.unsqueeze(-1) * response_mask
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.LP_GRPO_ASYNC)
+def compute_lp_grpo_async_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    non_tensor_batch: Optional[dict] = None,
+    lp_state: Optional[dict] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LP-GRPO Async (v_async): asymmetric per-rollout weighting.
+
+    Breaks the within-group symmetric invariant of GRPO by applying
+    different weights to correct (r=1) vs wrong (r=0) rollouts.
+
+    Formula (0 hyperparameters):
+        base_w = 4 * p_t * (1 - p_t)                  # ZPD magnitude
+        delta  = clip(p_t - p_0, -0.8, 0.8)           # asymmetric direction
+        w+     = base_w * (1 + delta * (1 - p_t))     # for correct rollouts
+        w-     = base_w * (1 - delta * p_t)           # for wrong rollouts
+        A_i_final = w_i * A_i_GRPO
+
+    Mathematical properties:
+      - mean(w_i) within group == base_w (LR-preserving by construction)
+      - w+ > 0, w- > 0 for delta in [-0.8, 0.8], p_t in [0,1]
+      - group net signal = base_w * delta * N * p_t(1-p_t) / sigma
+        This is NEW; both vanilla GRPO and symmetric LP have group net = 0.
+
+    Falls back to vanilla GRPO weights (w=1) when sigma_g < eps_useful
+    (degenerate group with no useful signal).
+    """
+    if non_tensor_batch is None or "index" not in non_tensor_batch:
+        raise ValueError(
+            "lp_grpo_async requires non_tensor_batch['index'] (persistent prompt id). "
+            "Set up dataset same as lp_grpo (p_zero column + extra_info.index)."
+        )
+    if lp_state is None or "p_0_map" not in lp_state:
+        raise ValueError(
+            "lp_grpo_async requires lp_state with 'p_0_map'. "
+            "Trainer must initialize lp_state same as lp_grpo path."
+        )
+
+    p_0_map = lp_state["p_0_map"]
+    persistent_idx_arr = non_tensor_batch["index"]
+    scores = token_level_rewards.sum(dim=-1)  # (B,)
+
+    id2score = defaultdict(list)
+    id2mean: dict = {}
+    id2std: dict = {}
+    uid_to_persistent: dict = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            uid = index[i]
+            id2score[uid].append(scores[i])
+            if uid not in uid_to_persistent:
+                uid_to_persistent[uid] = persistent_idx_arr[i]
+
+        for uid in id2score:
+            vals = torch.stack(id2score[uid])
+            if len(vals) == 1:
+                id2mean[uid] = torch.tensor(0.0)
+                id2std[uid] = torch.tensor(1.0)
+            else:
+                id2mean[uid] = vals.mean()
+                id2std[uid] = vals.std()
+
+        # v_async: compute per-group (w+, w-)
+        uid_to_w_plus: dict = {}
+        uid_to_w_minus: dict = {}
+        log_w_plus, log_w_minus, log_delta, log_net = [], [], [], []
+        log_p0, log_pt = [], []
+        log_active = 0
+
+        for uid in id2score:
+            sigma = float(id2std[uid].item())
+            p_t = float(id2mean[uid].item())
+            pid = uid_to_persistent[uid]
+            # fallback for first-seen prompt: delta = 0 (degenerates to symmetric ZPD)
+            p_0 = float(p_0_map.get(pid, p_t))
+
+            base_w = 4.0 * p_t * (1.0 - p_t)
+            delta = max(-0.8, min(0.8, p_t - p_0))
+
+            # Degenerate group (all same reward): no useful signal; behave like vanilla GRPO
+            if sigma < 1e-3:
+                uid_to_w_plus[uid] = 1.0
+                uid_to_w_minus[uid] = 1.0
+                continue
+
+            wp = base_w * (1.0 + delta * (1.0 - p_t))
+            wm = base_w * (1.0 - delta * p_t)
+            uid_to_w_plus[uid] = wp
+            uid_to_w_minus[uid] = wm
+
+            # Logging
+            group_rewards = torch.stack(id2score[uid])
+            n_plus = float((group_rewards > 0.5).sum().item())
+            n_minus = float(len(group_rewards)) - n_plus
+            net_signal = base_w * delta * (n_plus + n_minus) * p_t * (1.0 - p_t) / (sigma + epsilon)
+            log_w_plus.append(wp)
+            log_w_minus.append(wm)
+            log_delta.append(delta)
+            log_net.append(net_signal)
+            log_p0.append(p_0)
+            log_pt.append(p_t)
+            if abs(delta) > 0.05:
+                log_active += 1
+
+        # Apply per-rollout: select w+ or w- by reward
+        for i in range(bsz):
+            uid = index[i]
+            mu = id2mean[uid]
+            sigma_g = id2std[uid]
+
+            if norm_adv_by_std_in_grpo:
+                base_adv = (scores[i] - mu) / (sigma_g + epsilon)
+            else:
+                base_adv = scores[i] - mu
+
+            if scores[i].item() > 0.5:
+                w = uid_to_w_plus[uid]
+            else:
+                w = uid_to_w_minus[uid]
+            scores[i] = base_adv * w
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+        # Stash metrics for trainer
+        if log_w_plus:
+            wp_arr = np.asarray(log_w_plus)
+            wm_arr = np.asarray(log_w_minus)
+            d_arr = np.asarray(log_delta)
+            net_arr = np.asarray(log_net)
+            lp_state["last_metrics"] = {
+                "lp_async/w_plus/mean": float(wp_arr.mean()),
+                "lp_async/w_plus/max": float(wp_arr.max()),
+                "lp_async/w_plus/min": float(wp_arr.min()),
+                "lp_async/w_minus/mean": float(wm_arr.mean()),
+                "lp_async/w_minus/max": float(wm_arr.max()),
+                "lp_async/w_minus/min": float(wm_arr.min()),
+                "lp_async/delta/mean_abs": float(np.mean(np.abs(d_arr))),
+                "lp_async/delta/max_abs": float(np.max(np.abs(d_arr))),
+                "lp_async/delta/p50_abs": float(np.median(np.abs(d_arr))),
+                "lp_async/net_signal/mean_abs": float(np.mean(np.abs(net_arr))),
+                "lp_async/net_signal/max_abs": float(np.max(np.abs(net_arr))),
+                "lp_async/active_groups": float(log_active),
+                "lp_async/active_ratio": float(log_active) / max(1, len(log_w_plus)),
+                "lp_async/n_useful_groups": float(len(log_w_plus)),
+                "lp_async/p_0/mean": float(np.mean(log_p0)),
+                "lp_async/p_t/mean": float(np.mean(log_pt)),
+            }
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.LP_GRPO_V11)
+def compute_lp_grpo_v11_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    non_tensor_batch: Optional[dict] = None,
+    lp_state: Optional[dict] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LP-GRPO v1.1: fused ZPD+difficulty with tanh-bounded progress.
+
+    Formula:
+        w = 4 * p_t * (1 - p_t)^(gamma+1) * f_prog(delta)
+
+        delta = p_t - p_0
+        if delta >= 0:  f_prog = 1 + alpha * tanh(lam * delta)        (improving)
+        if delta < 0:   f_prog = 1 + beta  * tanh(lam * |delta|)      (regressing)
+
+    Config (read from AlgoConfig):
+        lp_v11_gamma  (default 0.5)  - ZPD-difficulty shape
+        lp_v11_alpha  (default 1.5)  - improving amplification strength
+        lp_v11_beta   (default 0.5)  - regressing amplification (set = alpha for symmetric)
+        lp_v11_lambda (default 5.0)  - tanh saturation speed
+
+    Behavior:
+        beta = alpha (e.g., 1.5): SYMMETRIC, improving and regressing equally amplified
+        beta < alpha (e.g., 0.5): MILD ASYMMETRIC, improving stronger but regressing still > 1
+        beta = 0:                  EXTREME ASYMMETRIC, regressing only gets f_prog = 1
+    """
+    if non_tensor_batch is None or "index" not in non_tensor_batch:
+        raise ValueError(
+            "lp_grpo_v11 requires non_tensor_batch['index'] (persistent prompt id). "
+            "Set up dataset same as lp_grpo (p_zero column + extra_info.index)."
+        )
+    if lp_state is None or "p_0_map" not in lp_state:
+        raise ValueError(
+            "lp_grpo_v11 requires lp_state with 'p_0_map'. "
+            "Trainer must initialize lp_state same as lp_grpo path."
+        )
+
+    # Read v1.1 hyperparameters from config
+    if config is not None:
+        v11_gamma = config.get("lp_v11_gamma", 0.5)
+        v11_alpha = config.get("lp_v11_alpha", 1.5)
+        v11_beta = config.get("lp_v11_beta", 0.5)
+        v11_lambda = config.get("lp_v11_lambda", 5.0)
+    else:
+        v11_gamma, v11_alpha, v11_beta, v11_lambda = 0.5, 1.5, 0.5, 5.0
+
+    p_0_map = lp_state["p_0_map"]
+    persistent_idx_arr = non_tensor_batch["index"]
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean: dict = {}
+    id2std: dict = {}
+    uid_to_persistent: dict = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            uid = index[i]
+            id2score[uid].append(scores[i])
+            if uid not in uid_to_persistent:
+                uid_to_persistent[uid] = persistent_idx_arr[i]
+
+        for uid in id2score:
+            vals = torch.stack(id2score[uid])
+            if len(vals) == 1:
+                id2mean[uid] = torch.tensor(0.0)
+                id2std[uid] = torch.tensor(1.0)
+            else:
+                id2mean[uid] = vals.mean()
+                id2std[uid] = vals.std()
+
+        # Per-group v1.1 weight
+        uid_to_w: dict = {}
+        log_w, log_delta, log_fprog = [], [], []
+        log_imp, log_reg, log_plat = 0, 0, 0
+        log_p0, log_pt = [], []
+        # Bucket counters (aligned with v1's lp/bucket/* for comparable logging)
+        bucket_counts = {k: 0 for k in LP_BUCKET_NAMES}
+        plateau_pt_vals = []
+
+        for uid in id2score:
+            p_t = float(id2mean[uid].item())
+            pid = uid_to_persistent[uid]
+            p_0 = float(p_0_map.get(pid, p_t))
+
+            # Fused ZPD + difficulty
+            fused = 4.0 * p_t * (1.0 - p_t) ** (v11_gamma + 1)
+
+            # Asymmetric f_prog
+            delta = p_t - p_0
+            if delta >= 0:
+                f_prog = 1.0 + v11_alpha * np.tanh(v11_lambda * delta)
+                log_imp += 1
+            else:
+                f_prog = 1.0 + v11_beta * np.tanh(v11_lambda * abs(delta))
+                log_reg += 1
+            if abs(delta) < 1e-3:
+                log_plat += 1
+
+            w = fused * f_prog
+            uid_to_w[uid] = w
+
+            log_w.append(w)
+            log_delta.append(delta)
+            log_fprog.append(f_prog)
+            log_p0.append(p_0)
+            log_pt.append(p_t)
+
+            # Bucket classification (same as v1)
+            bucket = _classify_lp_bucket(p_0, p_t)
+            bucket_counts[bucket] += 1
+            if bucket == "plateau":
+                plateau_pt_vals.append(p_t)
+
+        # Apply per-group w to all rollouts (symmetric per-rollout)
+        for i in range(bsz):
+            uid = index[i]
+            mu = id2mean[uid]
+            sigma_g = id2std[uid]
+            w = uid_to_w[uid]
+            if norm_adv_by_std_in_grpo:
+                scores[i] = (scores[i] - mu) / (sigma_g + epsilon) * w
+            else:
+                scores[i] = (scores[i] - mu) * w
+
+        scores = scores.unsqueeze(-1) * response_mask
+
+        # Log metrics
+        if log_w:
+            w_arr = np.asarray(log_w)
+            d_arr = np.asarray(log_delta)
+            fp_arr = np.asarray(log_fprog)
+            metrics = {
+                # v1.1-specific (under lp_v11/ namespace)
+                "lp_v11/w/mean": float(w_arr.mean()),
+                "lp_v11/w/max": float(w_arr.max()),
+                "lp_v11/w/min": float(w_arr.min()),
+                "lp_v11/w/std": float(w_arr.std()),
+                "lp_v11/delta/mean": float(d_arr.mean()),
+                "lp_v11/delta/abs_mean": float(np.abs(d_arr).mean()),
+                "lp_v11/f_prog/mean": float(fp_arr.mean()),
+                "lp_v11/f_prog/max": float(fp_arr.max()),
+                "lp_v11/improving_count": float(log_imp),
+                "lp_v11/regressing_count": float(log_reg),
+                "lp_v11/plateau_count": float(log_plat),
+                "lp_v11/n_groups": float(len(log_w)),
+                "lp_v11/config/alpha": float(v11_alpha),
+                "lp_v11/config/beta": float(v11_beta),
+                "lp_v11/config/asymmetry_ratio": float(v11_alpha / max(v11_beta, 1e-6)),
+                # Aligned with v1 (lp_grpo) for cross-version comparability:
+                "lp/w/mean": float(w_arr.mean()),
+                "lp/w/max": float(w_arr.max()),
+                "lp/w/min": float(w_arr.min()),
+                "lp/w/std": float(w_arr.std()),
+                "lp/w/raw_mean": float(w_arr.mean()),
+                "lp/w/cap_rate": 0.0,
+                "lp/f_prog/mean": float(fp_arr.mean()),
+                "lp/p_0/mean": float(np.mean(log_p0)),
+                "lp/p_t/mean": float(np.mean(log_pt)),
+                "lp/n_groups": float(len(log_w)),
+                **{f"lp/bucket/{k}": v for k, v in bucket_counts.items()},
+            }
+            if plateau_pt_vals:
+                metrics["lp/plateau/p_t_mean"] = float(np.mean(plateau_pt_vals))
+                metrics["lp/plateau/p_t_low_rate"] = float(np.mean(np.array(plateau_pt_vals) < 0.3))
+            lp_state["last_metrics"] = metrics
+
+    return scores, scores
+
+
+LP_BUCKET_NAMES = ("breakthrough", "progress", "plateau", "mastered", "regressing")
+
+
+def _classify_lp_bucket(p_0: float, p_t: float) -> str:
+    """Shared 5-bucket classification used by advantage reweight and adaptive-N.
+
+    Matches the inline logic in compute_lp_grpo_outcome_advantage so that both
+    paths agree on which bucket each prompt belongs to.
+    """
+    delta = p_t - p_0
+    if p_0 > 0.8 and delta >= 0:
+        return "mastered"
+    if delta < -0.05:
+        return "regressing"
+    if p_0 < 0.2 and delta > 0.15:
+        return "breakthrough"
+    if delta > 0.05:
+        return "progress"
+    return "plateau"
+
+
+def compute_lp_n_allocation_bucket(
+    persistent_indices,
+    p_0_map: dict,
+    last_p_t_map: dict,
+    n_total: int,
+    bucket_mult: dict,
+    n_min: int = 2,
+    n_max: Optional[int] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-bucket adaptive N allocation with A+B hybrid for first-seen prompts.
+
+    Motivation: weighted (w-proportional) allocation gives high-LP prompts more
+    rollouts but does NOT specifically help plateau prompts — those are stuck
+    because their reward signal is noisy (p_t~0.5 -> binom std ~0.18 at N=8).
+    Bucket allocation lets us say "plateau gets 2x N" explicitly, decoupling N
+    from the advantage weight.
+
+    Two modes are blended per-prompt to handle the chicken-and-egg issue of
+    needing p_t to classify the bucket:
+      - A (seen before, has last_p_t): classify into 5 buckets, use bucket_mult.
+      - B (first-seen, fallback): variance-driven, weight = plateau_mult * 4 *
+        p_0*(1-p_0). This peaks at p_0=0.5 matching plateau, falls to 0 at
+        p_0 in {0,1}. Rationale: with no p_t info, high binomial variance
+        (~0.5 success rate) is the best proxy for "needs more rollouts".
+
+    Budget is preserved exactly: sum(N_g) == n_total. Per-prompt N in [n_min, n_max].
+
+    Args:
+        persistent_indices: array-like length B, persistent prompt ids
+        p_0_map / last_p_t_map: lagged baseline / last-seen p_t per pid
+        n_total: total rollout budget (e.g., B * rollout.n)
+        bucket_mult: dict mapping bucket name -> relative N multiplier
+            (e.g., {"plateau": 2.0, "mastered": 0.5, ...})
+        n_min: minimum N per prompt (>=2 keeps GRPO std defined)
+        n_max: optional per-prompt cap
+
+    Returns:
+        n_g: int64 (B,), sum == n_total
+        bucket_idx: int64 (B,), index into LP_BUCKET_NAMES; -1 for first-seen (B mode)
+    """
+    B = len(persistent_indices)
+    if B == 0:
+        return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+
+    plateau_mult = float(bucket_mult.get("plateau", 2.0))
+
+    bucket_idx = np.full(B, -1, dtype=np.int64)  # -1 = first-seen (B mode)
+    mult = np.zeros(B, dtype=np.float64)
+    for i, pid in enumerate(persistent_indices):
+        p_0 = float(p_0_map.get(pid, 0.5))
+        if pid in last_p_t_map:
+            # A mode: bucket classification
+            p_t = float(last_p_t_map[pid])
+            name = _classify_lp_bucket(p_0, p_t)
+            mult[i] = float(bucket_mult.get(name, 1.0))
+            bucket_idx[i] = LP_BUCKET_NAMES.index(name)
+        else:
+            # B mode: variance-driven, scaled so peak (p_0=0.5) == plateau_mult
+            mult[i] = plateau_mult * 4.0 * p_0 * (1.0 - p_0)
+            # bucket_idx stays -1
+
+    mult_sum = float(mult.sum())
+
+    if B * n_min >= n_total:
+        # Not enough budget for n_min everywhere: distribute as evenly as possible.
+        base = n_total // B
+        residual = n_total - base * B
+        n_g = np.full(B, base, dtype=np.int64)
+        if residual > 0:
+            n_g[:residual] += 1
+        return n_g, bucket_idx
+
+    n_remaining = n_total - B * n_min
+    if mult_sum <= 0:
+        # Degenerate (e.g., all first-seen with p_0 in {0,1}): uniform fallback.
+        base = n_remaining // B
+        residual = n_remaining - base * B
+        n_g = np.full(B, n_min + base, dtype=np.int64)
+        if residual > 0:
+            n_g[:residual] += 1
+        return n_g, bucket_idx
+
+    n_g_float = n_remaining * (mult / mult_sum)
+    n_g_floor = np.floor(n_g_float).astype(np.int64)
+    residual = int(n_remaining - n_g_floor.sum())
+    if residual > 0:
+        frac = n_g_float - n_g_floor
+        order = np.argsort(-frac)
+        n_g_floor[order[:residual]] += 1
+
+    n_g = n_g_floor + n_min
+
+    if n_max is not None:
+        excess = int(np.maximum(n_g - n_max, 0).sum())
+        n_g = np.minimum(n_g, n_max)
+        if excess > 0:
+            non_capped_idx = np.where(n_g < n_max)[0]
+            if len(non_capped_idx) > 0:
+                order = non_capped_idx[np.argsort(-mult[non_capped_idx])]
+                k = 0
+                while excess > 0 and k < 1000 * len(order):
+                    j = order[k % len(order)]
+                    if n_g[j] < n_max:
+                        n_g[j] += 1
+                        excess -= 1
+                    k += 1
+
+    return n_g, bucket_idx
+
+
+def compute_lp_n_allocation(
+    persistent_indices,
+    p_0_map: dict,
+    last_p_t_map: dict,
+    n_total: int,
+    lp_gamma: float = 0.5,
+    lp_lambda: float = 3.0,
+    lp_w_max: float = 5.0,
+    lp_eps_p: float = 0.05,
+    n_min: int = 2,
+    n_max: Optional[int] = None,
+) -> np.ndarray:
+    """Compute per-prompt rollout count N_g using LP weights.
+
+    Used by LP-GRPO adaptive rollout allocation: at each step, before generating
+    rollouts, we estimate each prompt's learning value with the LP formula using
+    lagged p_t (from last_p_t_map; falls back to p_0 for first-seen prompts).
+    The N_g vector sums to n_total and each entry >= n_min.
+
+    Allocation uses largest-remainder method on normalized w:
+        share_g = (n_total - B*n_min) * w_g / sum(w_g)
+        N_g = floor(share_g) + (rank-based +1 for top fractional remainders) + n_min
+
+    Args:
+        persistent_indices: array-like of length B, persistent prompt ids
+        p_0_map: dict {persistent_idx -> baseline pass rate}
+        last_p_t_map: dict {persistent_idx -> last observed pass rate}
+        n_total: total rollout budget for this batch (e.g., batch_size * rollout.n)
+        lp_gamma/lambda/w_max/eps_p: LP formula hyperparameters
+        n_min: minimum rollouts per prompt (>=2 keeps GRPO std defined)
+        n_max: optional per-prompt cap (None = no cap; LP w is bounded by w_max anyway)
+
+    Returns:
+        np.ndarray (B,) int64, with sum(N_g) == n_total (modulo edge cases),
+        and (n_min <= N_g <= n_max if n_max set).
+    """
+    B = len(persistent_indices)
+    if B == 0:
+        return np.array([], dtype=np.int64)
+
+    # Step 1: compute raw LP w per prompt using lagged p_t
+    w = np.zeros(B, dtype=np.float64)
+    for i, pid in enumerate(persistent_indices):
+        p_0 = float(p_0_map.get(pid, 0.5))
+        p_t = float(last_p_t_map.get(pid, p_0))  # fallback: KL=0 → f_prog=1
+
+        p_0_c = min(max(p_0, lp_eps_p), 1.0 - lp_eps_p)
+        p_t_c = min(max(p_t, lp_eps_p), 1.0 - lp_eps_p)
+
+        kl = float(
+            p_t_c * np.log(p_t_c / p_0_c)
+            + (1.0 - p_t_c) * np.log((1.0 - p_t_c) / (1.0 - p_0_c))
+        )
+        if p_t_c > p_0_c:
+            f_diff = (1.0 - p_0_c) ** lp_gamma
+            f_prog = min(lp_w_max, max(1.0, 1.0 + lp_lambda * kl))
+        else:
+            f_diff = (1.0 - p_t_c) ** lp_gamma
+            f_prog = 1.0
+        w[i] = f_diff * f_prog
+
+    # Step 2: reserve n_min for each prompt, allocate rest proportional to w
+    if B * n_min >= n_total:
+        # Not enough budget for n_min everywhere: distribute as evenly as possible
+        base = n_total // B
+        residual = n_total - base * B
+        n_g = np.full(B, base, dtype=np.int64)
+        if residual > 0:
+            n_g[:residual] += 1
+        return n_g
+
+    n_remaining = n_total - B * n_min
+    w_sum = float(w.sum())
+    if w_sum <= 0:
+        # Degenerate (shouldn't happen normally): uniform distribution of remainder
+        base = n_remaining // B
+        residual = n_remaining - base * B
+        n_g = np.full(B, n_min + base, dtype=np.int64)
+        if residual > 0:
+            n_g[:residual] += 1
+        return n_g
+
+    # Largest-remainder allocation on n_remaining
+    n_g_float = n_remaining * (w / w_sum)
+    n_g_floor = np.floor(n_g_float).astype(np.int64)
+    residual = int(n_remaining - n_g_floor.sum())
+    if residual > 0:
+        frac = n_g_float - n_g_floor
+        order = np.argsort(-frac)
+        n_g_floor[order[:residual]] += 1
+
+    n_g = n_g_floor + n_min
+
+    # Optional cap
+    if n_max is not None:
+        excess = int(np.maximum(n_g - n_max, 0).sum())
+        n_g = np.minimum(n_g, n_max)
+        if excess > 0:
+            # Redistribute excess to non-capped prompts (round-robin by w order)
+            non_capped_mask = n_g < n_max
+            non_capped_idx = np.where(non_capped_mask)[0]
+            if len(non_capped_idx) > 0:
+                # Sort non-capped by w descending; cycle to add 1 each
+                order = non_capped_idx[np.argsort(-w[non_capped_idx])]
+                k = 0
+                while excess > 0 and k < 1000 * len(order):
+                    j = order[k % len(order)]
+                    if n_g[j] < n_max:
+                        n_g[j] += 1
+                        excess -= 1
+                    k += 1
+
+    return n_g
 
 
 @register_adv_est(AdvantageEstimator.GDPO)  # or simply: @register_adv_est("gdpo")

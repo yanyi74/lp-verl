@@ -1012,6 +1012,49 @@ class DataProto:
             meta_info=self.meta_info,
         )
 
+    def repeat_per_row(self, repeats):
+        """Repeat each row by a per-row repeat count (always interleave-style).
+
+        Used by LP-GRPO adaptive rollout allocation, where different prompts
+        get different numbers of rollouts.
+
+        Args:
+            repeats (Sequence[int] | torch.Tensor | np.ndarray): length == len(self),
+                non-negative integers. Row i is repeated repeats[i] times.
+
+        Returns:
+            DataProto: A new DataProto whose length == sum(repeats).
+        """
+        n_rows = len(self)
+        if isinstance(repeats, torch.Tensor):
+            repeats_t = repeats.detach().to(torch.long).cpu()
+        else:
+            repeats_t = torch.as_tensor(list(repeats), dtype=torch.long)
+        assert repeats_t.shape == (n_rows,), (
+            f"repeat_per_row: repeats length {repeats_t.shape} != n_rows {n_rows}"
+        )
+        assert (repeats_t >= 0).all(), "repeat_per_row: all repeats must be >= 0"
+        total = int(repeats_t.sum().item())
+        repeats_np = repeats_t.numpy()
+
+        if self.batch is not None:
+            repeated_tensors = {
+                key: tensor.repeat_interleave(repeats_t, dim=0) for key, tensor in self.batch.items()
+            }
+            repeated_batch = TensorDict(source=repeated_tensors, batch_size=(total,))
+        else:
+            repeated_batch = None
+
+        repeated_non_tensor_batch = {
+            key: np.repeat(val, repeats_np, axis=0) for key, val in self.non_tensor_batch.items()
+        }
+
+        return type(self)(
+            batch=repeated_batch,
+            non_tensor_batch=repeated_non_tensor_batch,
+            meta_info=self.meta_info,
+        )
+
     def unfold_column_chunks(self, n_split: int, split_keys: Optional[list[str]] = None):
         """Split along the second dim into `n_split`, unfold it to the first dim (batch dim)
         Useful in passing grouped tensors that doesn't want to be shuffled in dataset.
