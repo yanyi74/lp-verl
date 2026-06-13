@@ -160,6 +160,12 @@ algorithm:
   lp_v11_beta: 0.5
   lp_v11_lambda: 5.0
 
+  # LP-GRPO v2: w = (1-p0)^gamma * asym-tanh(dema); dema from LPRevisitSampler
+  lp_v2_gamma: 0.5
+  lp_v2_alpha: 1.0
+  lp_v2_beta: 0.4
+  lp_v2_k: 8.0
+
 # config for the trainer
 trainer:
 

@@ -228,6 +228,10 @@ def compute_advantage(
         if adv_estimator in (AdvantageEstimator.LP_GRPO_V11, "lp_grpo_v11"):
             adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
             adv_kwargs["lp_state"] = lp_state
+        # LP-GRPO v2: (1-p0)^g * asym tanh progress; reads dema_map from sampler
+        if adv_estimator in (AdvantageEstimator.LP_GRPO_V2, "lp_grpo_v2"):
+            adv_kwargs["non_tensor_batch"] = data.non_tensor_batch
+            adv_kwargs["lp_state"] = lp_state
         # Add sum_pi_squared for Optimal Token Baseline
         if adv_estimator in (AdvantageEstimator.OPTIMAL_TOKEN_BASELINE, AdvantageEstimator.TIR_OPTIMAL_TOKEN_BASELINE):
             # Check if sum_pi_squared is available
@@ -1368,12 +1372,20 @@ class RayPPOTrainer:
         # Keys are persistent prompt ids from non_tensor_batch["index"].
         # p_0_map is loaded from the dataset's `p_zero` column (user-prepared
         # offline) and refreshed each epoch from last_p_t_map.
-        self.lp_state = {"p_0_map": {}, "last_p_t_map": {}}
+        self.lp_state = {"p_0_map": {}, "last_p_t_map": {}, "dema_map": {}}
         # Always attempt to load p_0_map from the dataset's p_zero column.
         # _load_lp_grpo_p0_from_dataset is a no-op when the column is absent, so
         # this is safe for datasets without p_zero. For GRPO runs this enables LP
         # bucket monitoring without affecting the gradient computation.
         self._load_lp_grpo_p0_from_dataset()
+
+        # LP-GRPO v2: if the LPRevisitSampler is in use, share its dema_map so the
+        # advantage estimator (lp_grpo_v2) reads the smoothed learning-progress
+        # signal maintained by the sampler.
+        _sampler = getattr(self.train_dataloader, "sampler", None)
+        if _sampler is not None and hasattr(_sampler, "dema_map"):
+            self.lp_state["dema_map"] = _sampler.dema_map
+            print("[LP-GRPO v2] linked sampler.dema_map -> lp_state['dema_map']")
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()

@@ -734,3 +734,12 @@ class AlgoConfig(BaseConfig):
     lp_v11_alpha: float = 1.5    # improving amplification strength
     lp_v11_beta: float = 0.5     # regressing amplification (beta=alpha: sym, beta<alpha: asym)
     lp_v11_lambda: float = 5.0   # tanh saturation speed
+
+    # LP-GRPO v2 (adv_estimator='lp_grpo_v2'):
+    #   w = (1-p0)^gamma * f_prog(dema);  f_prog = 1 + a*tanh(k*d) [d>=0] / 1 + b*tanh(k|d|) [d<0]
+    #   - difficulty anchor uses p0 (orthogonal to sigma), NO continuous ZPD
+    #   - dema = smoothed double-EMA learning progress (from LPRevisitSampler)
+    lp_v2_gamma: float = 0.5     # difficulty anchor exponent
+    lp_v2_alpha: float = 1.0     # improving progress strength
+    lp_v2_beta: float = 0.4      # regressing progress strength (beta<alpha, but >0: regress still rewarded)
+    lp_v2_k: float = 8.0         # tanh saturation speed on dema

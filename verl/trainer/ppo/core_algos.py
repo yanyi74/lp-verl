@@ -111,6 +111,7 @@ class AdvantageEstimator(str, Enum):
     LP_GRPO = "lp_grpo"
     LP_GRPO_ASYNC = "lp_grpo_async"
     LP_GRPO_V11 = "lp_grpo_v11"
+    LP_GRPO_V2 = "lp_grpo_v2"
 
 
 ADV_ESTIMATOR_REGISTRY: dict[str, Any] = {}
@@ -1077,6 +1078,123 @@ def compute_lp_grpo_v11_outcome_advantage(
                 metrics["lp/plateau/p_t_mean"] = float(np.mean(plateau_pt_vals))
                 metrics["lp/plateau/p_t_low_rate"] = float(np.mean(np.array(plateau_pt_vals) < 0.3))
             lp_state["last_metrics"] = metrics
+
+    return scores, scores
+
+
+@register_adv_est(AdvantageEstimator.LP_GRPO_V2)
+def compute_lp_grpo_v2_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    epsilon: float = 1e-6,
+    norm_adv_by_std_in_grpo: bool = True,
+    config: Optional[AlgoConfig] = None,
+    non_tensor_batch: Optional[dict] = None,
+    lp_state: Optional[dict] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LP-GRPO v2: difficulty anchor x continuous asymmetric progress factor.
+
+    A_i = A_i^GRPO * w_x
+    w_x = (1 - p0_x)^gamma * f_prog(dema_x)
+      f_prog(d) = 1 + alpha * tanh(k*d)      if d >= 0  (improving)
+                = 1 + beta  * tanh(k*|d|)     if d <  0  (regressing, beta<alpha)
+
+    Key differences from v1/v11 (data-driven fixes):
+      - difficulty anchor uses p0 (offline prior), NOT p_t  -> orthogonal to sigma
+      - NO continuous ZPD 4p(1-p) (it is ~sigma^2, redundant, hurt high-p_t prompts)
+      - progress signal `dema` is the SMOOTHED double-EMA learning progress
+        maintained by the revisit sampler (lp_state["dema_map"]), reliable under
+        dense revisit. Falls back to single-step (p_t - p0) if dema unavailable.
+
+    The `dema_map` is updated by LPRevisitSampler.update(); here we only READ it.
+    """
+    if non_tensor_batch is None or "index" not in non_tensor_batch:
+        raise ValueError("lp_grpo_v2 requires non_tensor_batch['index'].")
+    if lp_state is None or "p_0_map" not in lp_state:
+        raise ValueError("lp_grpo_v2 requires lp_state with 'p_0_map'.")
+
+    if config is not None:
+        gamma = config.get("lp_v2_gamma", 0.5)
+        alpha = config.get("lp_v2_alpha", 1.0)
+        beta = config.get("lp_v2_beta", 0.4)
+        k = config.get("lp_v2_k", 8.0)
+    else:
+        gamma, alpha, beta, k = 0.5, 1.0, 0.4, 8.0
+
+    p_0_map = lp_state["p_0_map"]
+    dema_map = lp_state.get("dema_map", {})  # filled by sampler; may be empty early
+    persistent_idx_arr = non_tensor_batch["index"]
+    scores = token_level_rewards.sum(dim=-1)
+
+    id2score = defaultdict(list)
+    id2mean: dict = {}
+    id2std: dict = {}
+    uid_to_persistent: dict = {}
+
+    with torch.no_grad():
+        bsz = scores.shape[0]
+        for i in range(bsz):
+            uid = index[i]
+            id2score[uid].append(scores[i])
+            if uid not in uid_to_persistent:
+                uid_to_persistent[uid] = persistent_idx_arr[i]
+        for uid in id2score:
+            vals = torch.stack(id2score[uid])
+            if len(vals) == 1:
+                id2mean[uid] = torch.tensor(0.0)
+                id2std[uid] = torch.tensor(1.0)
+            else:
+                id2mean[uid] = vals.mean()
+                id2std[uid] = vals.std()
+
+        uid_to_w: dict = {}
+        log_w, log_dema, log_p0, log_fprog = [], [], [], []
+        for uid in id2score:
+            pid = uid_to_persistent[uid]
+            p_t = float(id2mean[uid].item())
+            p_0 = float(p_0_map.get(pid, p_t))
+            # progress: prefer smoothed dema from sampler; fallback to single-step
+            if pid in dema_map:
+                d = float(dema_map[pid])
+            else:
+                d = p_t - p_0
+            # difficulty anchor (uses p_0, orthogonal to sigma); clip p0 to [eps,1-eps]
+            p0c = min(max(p_0, 1e-3), 1.0 - 1e-3)
+            f_diff = (1.0 - p0c) ** gamma
+            # continuous asymmetric progress factor (bounded by tanh)
+            if d >= 0:
+                f_prog = 1.0 + alpha * np.tanh(k * d)
+            else:
+                f_prog = 1.0 + beta * np.tanh(k * abs(d))
+            w = f_diff * f_prog
+            uid_to_w[uid] = w
+            log_w.append(w); log_dema.append(d); log_p0.append(p_0); log_fprog.append(f_prog)
+
+        for i in range(bsz):
+            uid = index[i]
+            mu, sig = id2mean[uid], id2std[uid]
+            if norm_adv_by_std_in_grpo:
+                base_adv = (scores[i] - mu) / (sig + epsilon)
+            else:
+                base_adv = scores[i] - mu
+            scores[i] = base_adv * uid_to_w[uid]
+        scores = scores.unsqueeze(-1) * response_mask
+
+        if log_w:
+            w_arr = np.asarray(log_w); d_arr = np.asarray(log_dema)
+            lp_state["last_metrics"] = {
+                "lp_v2/w/mean": float(w_arr.mean()), "lp_v2/w/max": float(w_arr.max()),
+                "lp_v2/w/min": float(w_arr.min()), "lp_v2/w/std": float(w_arr.std()),
+                "lp_v2/dema/mean": float(d_arr.mean()), "lp_v2/dema/abs_mean": float(np.abs(d_arr).mean()),
+                "lp_v2/dema/pos_rate": float((d_arr > 0.05).mean()),
+                "lp_v2/dema/neg_rate": float((d_arr < -0.05).mean()),
+                "lp_v2/f_prog/mean": float(np.mean(log_fprog)),
+                "lp_v2/p0/mean": float(np.mean(log_p0)),
+                "lp_v2/n_groups": float(len(log_w)),
+                "lp_v2/dema_from_sampler": float(sum(1 for uid in id2score if uid_to_persistent[uid] in dema_map)),
+            }
 
     return scores, scores
 
