@@ -1820,6 +1820,9 @@ class RayPPOTrainer:
                 # this is experimental and may be changed/removed in the future in favor of a general-purpose one
                 if isinstance(self.train_dataloader.sampler, AbstractCurriculumSampler):
                     self.train_dataloader.sampler.update(batch=batch)
+                    # log bias-free global pool stats (coverage, retire, global dema)
+                    if hasattr(self.train_dataloader.sampler, "get_metrics"):
+                        metrics.update(self.train_dataloader.sampler.get_metrics())
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
@@ -1848,6 +1851,7 @@ class RayPPOTrainer:
                 AdvantageEstimator.LP_GRPO, "lp_grpo",
                 AdvantageEstimator.LP_GRPO_ASYNC, "lp_grpo_async",
                 AdvantageEstimator.LP_GRPO_V11, "lp_grpo_v11",
+                AdvantageEstimator.LP_GRPO_V2, "lp_grpo_v2",
             ) and self.lp_state["p_0_map"]:
                 p0_vals = np.array(list(self.lp_state["p_0_map"].values()), dtype=np.float64)
                 if len(p0_vals) > 0:

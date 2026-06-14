@@ -1151,6 +1151,11 @@ def compute_lp_grpo_v2_outcome_advantage(
 
         uid_to_w: dict = {}
         log_w, log_dema, log_p0, log_fprog = [], [], [], []
+        # bucket counts: two views for cross-version alignment
+        #   bucket_pt  : classify by (p_0, p_t) — SAME as v1/v11 lp/bucket/* (comparable)
+        #   bucket_dema: classify by (p_0, p_0+dema) — v2's actual smoothed signal
+        bucket_pt = {kk: 0 for kk in LP_BUCKET_NAMES}
+        bucket_dema = {kk: 0 for kk in LP_BUCKET_NAMES}
         for uid in id2score:
             pid = uid_to_persistent[uid]
             p_t = float(id2mean[uid].item())
@@ -1171,6 +1176,9 @@ def compute_lp_grpo_v2_outcome_advantage(
             w = f_diff * f_prog
             uid_to_w[uid] = w
             log_w.append(w); log_dema.append(d); log_p0.append(p_0); log_fprog.append(f_prog)
+            # bucket bookkeeping (aligned with v1/v11 + dema-based view)
+            bucket_pt[_classify_lp_bucket(p_0, p_t)] += 1
+            bucket_dema[_classify_lp_bucket(p_0, min(max(p_0 + d, 0.0), 1.0))] += 1
 
         for i in range(bsz):
             uid = index[i]
@@ -1194,6 +1202,10 @@ def compute_lp_grpo_v2_outcome_advantage(
                 "lp_v2/p0/mean": float(np.mean(log_p0)),
                 "lp_v2/n_groups": float(len(log_w)),
                 "lp_v2/dema_from_sampler": float(sum(1 for uid in id2score if uid_to_persistent[uid] in dema_map)),
+                # bucket counts aligned with v1/v11 lp/bucket/* (classify by p_0,p_t) for cross-version comparison
+                **{f"lp/bucket/{kk}": v for kk, v in bucket_pt.items()},
+                # v2's own dema-based buckets (classify by p_0, p_0+dema)
+                **{f"lp_v2/bucket/{kk}": v for kk, v in bucket_dema.items()},
             }
 
     return scores, scores
