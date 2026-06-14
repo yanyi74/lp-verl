@@ -369,11 +369,28 @@ def create_rl_sampler(data_config, dataset):
             data_config=data_config,
         )
         assert isinstance(sampler, AbstractSampler)
-        assert data_config.get("dataloader_num_workers", 8) == 0, (
-            "If using curriculum, num_workers must be 0 to prevent data caching. "
-            "If the dataloader caches data before the batch is done the "
-            "curriculum sampler won't have the opportunity to reorder it. "
+        # NOTE: relaxed from hard `==0` to allow workers for IO parallelism.
+        # The sampler runs on the main process; workers only do dataset[idx], so
+        # state updates still propagate. With prefetch the curriculum sees
+        # ~(num_workers * prefetch_factor) batches of staleness, which is fine
+        # for slow-EMA curricula (e.g., LPRevisitSampler's dema). Cap at 4 to
+        # bound the staleness window.
+        _nw = data_config.get("dataloader_num_workers", 8)
+        assert _nw <= 16, (
+            f"Curriculum sampler tolerates num_workers<=16 (got {_nw}); "
+            "higher values cause too much prefetch staleness "
+            "(>26% of an epoch's worth of indices may be selected with stale state, "
+            "hurting DEMA-based curricula). "
+            "Set data.dataloader_num_workers in [0, 16]."
         )
+        if _nw > 0:
+            import warnings
+            warnings.warn(
+                f"[curriculum] num_workers={_nw}: sampler state lags "
+                f"~{_nw * 2} batches due to DataLoader prefetch. "
+                "OK for slow-EMA curricula; not for fast-reactive ones.",
+                stacklevel=2,
+            )
 
     # Use a sampler to facilitate checkpoint resumption.
     # If shuffling is enabled in the data configuration, create a random sampler.

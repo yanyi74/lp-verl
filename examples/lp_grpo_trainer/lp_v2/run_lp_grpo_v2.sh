@@ -34,7 +34,7 @@ export SWANLAB_API_KEY=${SWANLAB_API_KEY:-"mruvFouNUCTig4mwbR0qJ"}
 
 ########################### multi-node bootstrap ###########################
 NODE_RANK=${NODE_RANK:-0}
-HEAD_IP=${HEAD_IP:-10.144.205.28}
+HEAD_IP=${HEAD_IP:-10.144.203.206}
 RAY_PORT=${RAY_PORT:-6379}
 DASHBOARD_PORT=${DASHBOARD_PORT:-8265}
 
@@ -116,14 +116,18 @@ LP_V2_K=${LP_V2_K:-8.0}              # tanh saturation on dema
 LP_EPS_P=${LP_EPS_P:-0.05}
 
 # ----- LPRevisitSampler (dense-revisit curriculum) knobs -----
-LP_POOL_SIZE=${LP_POOL_SIZE:-2000}        # active pool size (controls revisit interval)
+# Tuned for the 30,445-prompt dataset (67% useful, 33% stuck-hard p0<0.05):
+#   pool=3000 -> revisit interval ~33 steps -> DEMA reliable by step ~100
+#   reserve=27,445 ~ matches total fresh draws (38/step * 714 steps) -> full coverage
+#   K=2, T=150, M=5 -> evict the stuck-hard 33% quickly, keep pool slots for useful prompts
+LP_POOL_SIZE=${LP_POOL_SIZE:-3000}        # active pool size (controls revisit interval)
 LP_REVISIT_RATIO=${LP_REVISIT_RATIO:-0.7} # fraction of batch from pool (rest fresh)
 LP_DEMA_ALPHA=${LP_DEMA_ALPHA:-0.4}       # dema EMA coefficient
 LP_BASE_BETA=${LP_BASE_BETA:-0.2}         # base EMA coefficient
-LP_THETA=${LP_THETA:-0.05}                # progress deadzone
-LP_STUCK_K=${LP_STUCK_K:-3}               # consecutive 0/8 -> cooldown
-LP_MAX_VISIT=${LP_MAX_VISIT:-6}           # soft visit cap
-LP_COOLDOWN_T=${LP_COOLDOWN_T:-100}       # cooldown steps before revive
+LP_THETA=${LP_THETA:-0.03}                # progress deadzone (stricter than default 0.05)
+LP_STUCK_K=${LP_STUCK_K:-2}               # consecutive 0/8 -> cooldown (was 3, evict harder prompts faster)
+LP_MAX_VISIT=${LP_MAX_VISIT:-5}           # soft visit cap (was 6, early graduate gives reserve room)
+LP_COOLDOWN_T=${LP_COOLDOWN_T:-150}       # cooldown steps before revive (was 100, slower retry)
 LP_SCORE_LAM=${LP_SCORE_LAM:-3.0}         # progress boost in sampling score
 
 DEFAULT_SYSTEM_PROMPT='You FIRST think about the reasoning process step by step as an internal monologue and then provide the final answer. The reasoning process MUST BE enclosed within <thought> </thought> tags. The final answer MUST BE put in \boxed{}.'
@@ -179,8 +183,8 @@ DATA=(
     data.filter_overlong_prompts=True
     data.filter_overlong_prompts_workers=64
     data.truncation='error'
-    data.dataloader_num_workers=0
-    data.sampler.class_path=verl.experimental.dataset.lp_revisit_sampler
+    data.dataloader_num_workers=8
+    data.sampler.class_path=pkg://verl.experimental.dataset.lp_revisit_sampler
     data.sampler.class_name=LPRevisitSampler
     "+data.lp_sampler.pool_size=${LP_POOL_SIZE}"
     "+data.lp_sampler.revisit_ratio=${LP_REVISIT_RATIO}"
