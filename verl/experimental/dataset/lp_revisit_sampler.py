@@ -42,6 +42,7 @@ class LPRevisitSampler(AbstractCurriculumSampler):
         self.beta = float(c.get("beta", 0.2))               # base EMA (slow baseline)
         self.theta = float(c.get("theta", 0.05))            # progress deadzone (for metrics)
         self.eps = float(c.get("eps", 0.05))                # ~0/8 and ~8/8 thresholds
+        self.new_floor = float(c.get("new_floor", 1.0))     # min score for unseen prompts (coverage)
         self.seed = int(data_config.get("seed", 1) or 1)
         self.rng = np.random.default_rng(self.seed)
 
@@ -96,20 +97,32 @@ class LPRevisitSampler(AbstractCurriculumSampler):
         p = np.clip(p, 0.0, 1.0)
         gate = np.sqrt(np.maximum(4.0 * p * (1.0 - p), 0.0))
         sc = (1.0 + np.maximum(0.0, self.dema)) * gate + 1e-3
-        sc[self.visit >= self.M] = 0.0                                  # retired
-        sc[self._step - self.last_visit < self.min_interval] = 0.0      # cooling
+        # NEW: unseen prompts get a guaranteed base score so coverage is not
+        # starved by high-scoring revisited prompts (fixes "new prompts never
+        # get in"). new-prompt floor >= typical revisit score keeps exploration.
+        unseen = self.visit == 0
+        sc[unseen] = np.maximum(sc[unseen], self.new_floor)
+        # retired: trained M times -> never sampled again (hard, permanent)
+        sc[self.visit >= self.M] = 0.0
+        # cooling: just-trained prompt waits min_interval steps
+        sc[self._step - self.last_visit < self.min_interval] = 0.0
         return sc
 
     def __len__(self):
         return self.N
 
     def __iter__(self):
-        # Yield N indices per epoch. Each batch-worth is re-selected from the
-        # WHOLE dataset by value score; eligibility (min_interval, max_visit)
-        # and the score together make revisit/eviction/coverage emerge.
+        # Yield N indices per epoch, re-selected from the WHOLE dataset by value
+        # score. The DataLoader may pull several batches before update() runs, so
+        # self.visit can lag. We keep a provisional pick-count within this pass and
+        # fold it in, so a prompt is never picked more than (M - already_visited)
+        # times here -> hard cap M is respected even under prefetch.
         n_yield = 0
+        prov = np.zeros(self.N, dtype=np.int32)  # provisional picks this pass
         while n_yield < self.N:
             scores = self._scores_all()
+            # respect hard cap including provisional picks not yet in self.visit
+            scores[self.visit + prov >= self.M] = 0.0
             elig = scores > 0
             n_elig = int(elig.sum())
             take = min(self.batch_size, self.N - n_yield)
@@ -117,14 +130,14 @@ class LPRevisitSampler(AbstractCurriculumSampler):
                 p = scores / scores.sum()
                 chosen = self.rng.choice(self.N, size=take, replace=False, p=p)
             else:
-                # not enough eligible (cold-start / everything cooling):
-                # take all eligible + fill randomly from the rest
                 head = list(np.where(elig)[0])
                 rest = list(np.where(~elig)[0])
                 self.rng.shuffle(rest)
                 chosen = np.array((head + rest)[:take])
             for pid in chosen:
-                yield int(pid)
+                pid = int(pid)
+                prov[pid] += 1
+                yield pid
                 n_yield += 1
                 if n_yield >= self.N:
                     break
